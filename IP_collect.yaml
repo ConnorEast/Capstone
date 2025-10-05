@@ -1,0 +1,205 @@
+---
+- name: Get VM IP addresses from Proxmox using QEMU guest agent
+  hosts: pves
+  gather_facts: yes
+  become: yes
+
+  tasks:
+    - name: Get list of all VMs
+      shell: qm list
+      register: vm_list_raw
+      changed_when: false
+
+    - name: Parse VM list to get VMID and names
+      set_fact:
+        vm_info: >-
+          {%- set vms = [] -%}
+          {%- for line in vm_list_raw.stdout_lines[1:] -%}
+            {%- set parts = line.split() -%}
+            {%- if parts|length >= 3 and parts[2] == 'running' -%}
+              {%- set _ = vms.append({'vmid': parts[0], 'name': parts[1], 'status': parts[2]}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ vms }}
+
+    - name: Display found running VMs
+      debug:
+        msg: "Found running VMs: {{ vm_info | map(attribute='name') | join(', ') }}"
+
+    - name: Check if guest agent is enabled for each VM
+      shell: qm config {{ item.vmid }} | grep -E '^agent:'
+      register: agent_check
+      loop: "{{ vm_info }}"
+      failed_when: false
+      changed_when: false
+
+    - name: Get network interfaces from guest agent for each VM
+      shell: qm guest cmd {{ item.vmid }} network-get-interfaces
+      register: vm_network_info
+      loop: "{{ vm_info }}"
+      when: vm_info | length > 0
+      failed_when: false
+      changed_when: false
+
+    - name: Parse and display VM IP addresses
+      debug:
+        msg: |
+          VM: {{ item.item.name }} (ID: {{ item.item.vmid }})
+          Guest Agent: {{ 'Available' if item.rc == 0 else 'Not available or not responding' }}
+          IP Addresses: {{ vm_ips | join(', ') if vm_ips else 'No IP addresses found' }}
+      vars:
+        vm_ips: >-
+          {%- if item.rc == 0 and item.stdout -%}
+            {%- set network_data = item.stdout | from_json -%}
+            {%- set ips = [] -%}
+            {%- for interface in network_data -%}
+              {%- if interface['ip-addresses'] is defined -%}
+                {%- for ip_info in interface['ip-addresses'] -%}
+                  {%- if ip_info['ip-address-type'] == 'ipv4' and not ip_info['ip-address'].startswith('127.') -%}
+                    {%- set _ = ips.append(ip_info['ip-address']) -%}
+                  {%- endif -%}
+                {%- endfor -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {{ ips }}
+          {%- else -%}
+            []
+          {%- endif -%}
+      loop: "{{ vm_network_info.results }}"
+      when: vm_network_info.results is defined
+
+    - name: Create summary of all VM IPs
+      set_fact:
+        vm_ip_summary: >-
+          {%- set summary = {} -%}
+          {%- for result in vm_network_info.results -%}
+            {%- if result.rc == 0 and result.stdout -%}
+              {%- set network_data = result.stdout | from_json -%}
+              {%- set ips = [] -%}
+              {%- for interface in network_data -%}
+                {%- if interface['ip-addresses'] is defined -%}
+                  {%- for ip_info in interface['ip-addresses'] -%}
+                    {%- if ip_info['ip-address-type'] == 'ipv4' and not ip_info['ip-address'].startswith('127.') -%}
+                      {%- set _ = ips.append(ip_info['ip-address']) -%}
+                    {%- endif -%}
+                  {%- endfor -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {%- set _ = summary.update({result.item.name: ips}) -%}
+            {%- else -%}
+              {%- set _ = summary.update({result.item.name: 'Guest agent not available'}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ summary }}
+      when: vm_network_info.results is defined
+
+    - name: Sort VMs by IP address (lowest to highest)
+      set_fact:
+        sorted_vm_ips: >-
+          {%- set sorted_vms = [] -%}
+          {%- for vm_name, ips in vm_ip_summary.items() -%}
+            {%- if ips is not string and ips | length > 0 -%}
+              {%- set primary_ip = ips | first -%}
+              {%- set ip_parts = primary_ip.split('.') | map('int') | list -%}
+              {%- set sort_key = ip_parts[0] * 16777216 + ip_parts[1] * 65536 + ip_parts[2] * 256 + ip_parts[3] -%}
+              {%- set _ = sorted_vms.append({'name': vm_name, 'ips': ips, 'sort_key': sort_key, 'primary_ip': primary_ip}) -%}
+            {%- else -%}
+              {%- set _ = sorted_vms.append({'name': vm_name, 'ips': ips, 'sort_key': 999999999, 'primary_ip': 'No IP'}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ sorted_vms | sort(attribute='sort_key') }}
+      when: vm_ip_summary is defined
+
+    - name: Get current node name
+      shell: hostname
+      register: node_name
+      changed_when: false
+
+    - name: Get current timestamp
+      shell: date '+%Y-%m-%d %H:%M:%S'
+      register: current_time
+      changed_when: false
+
+    - name: Collect VM data for consolidation
+      set_fact:
+        node_vm_data:
+          node_name: "{{ node_name.stdout }}"
+          timestamp: "{{ current_time.stdout }}"
+          vms: "{{ sorted_vm_ips }}"
+      when: sorted_vm_ips is defined
+
+    - name: Display node summary
+      debug:
+        msg: |
+          ===========================================
+          Node: {{ node_name.stdout }}
+          ===========================================
+          {% for vm in sorted_vm_ips -%}
+          {{ vm.name }}: {{ vm.ips if vm.ips is string else vm.ips | join(', ') }}
+          {% endfor -%}
+      when: sorted_vm_ips is defined
+
+- name: Consolidate and save report on Ansible control machine
+  hosts: localhost
+  gather_facts: yes
+  become: no
+
+  tasks:
+    - name: Gather all node data
+      set_fact:
+        all_nodes_data: "{{ hostvars | dict2items | selectattr('value.node_vm_data', 'defined') | map(attribute='value.node_vm_data') | list }}"
+
+    - name: Get current timestamp for report
+      shell: date '+%Y-%m-%d_%H-%M-%S'
+      register: report_timestamp
+      changed_when: false
+      delegate_to: localhost
+
+    - name: Create consolidated VM IP report
+      copy:
+        content: |
+          ===========================================
+          CONSOLIDATED PROXMOX VM IP ADDRESS REPORT
+          ===========================================
+          Generated: {{ ansible_date_time.date }} {{ ansible_date_time.time }}
+          Total Nodes: {{ all_nodes_data | length }}
+          ===========================================
+
+          {% for node_data in all_nodes_data %}
+          NODE: {{ node_data.node_name }}
+          --------------------
+          {% for vm in node_data.vms -%}
+          {{ vm.name }}: {{ vm.ips if vm.ips is string else vm.ips | join(', ') }}
+          {% endfor %}
+          Total VMs on {{ node_data.node_name }}: {{ node_data.vms | length }}
+          Active IPs on {{ node_data.node_name }}: {{ node_data.vms | selectattr('primary_ip', 'ne', 'No IP') | list | length }}
+
+          {% endfor %}
+          ===========================================
+          OVERALL SUMMARY
+          ===========================================
+          Total VMs across all nodes: {{ all_nodes_data | map(attribute='vms') | map('length') | sum }}
+          Total active IPs: {{ all_nodes_data | map(attribute='vms') | flatten | selectattr('primary_ip', 'ne', 'No IP') | list | length }}
+          ===========================================
+        dest: "/tmp/consolidated_vm_ip_report_{{ report_timestamp.stdout }}.txt"
+        mode: '0644'
+      when: all_nodes_data | length > 0
+
+    - name: Display consolidated report location
+      debug:
+        msg: "Consolidated VM IP report saved to: /tmp/consolidated_vm_ip_report_{{ report_timestamp.stdout }}.txt"
+      when: all_nodes_data | length > 0
+
+    - name: Display agent configuration info
+      debug:
+        msg: |
+          Guest Agent Configuration:
+          {% for result in agent_check.results %}
+          {{ result.item.name }}: {{ 'Enabled' if result.rc == 0 else 'Not enabled or not configured' }}
+          {% endfor %}
+      when: agent_check.results is defined
+
+    - name: No running VMs found message
+      debug:
+        msg: "No running VMs found on this Proxmox node"
+      when: vm_info | length == 0
