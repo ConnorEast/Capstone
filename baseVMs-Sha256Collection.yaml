@@ -1,0 +1,136 @@
+- name: Collect SHA256 hashes from all Proxmox nodes
+  hosts: ProxmoxServers
+  become: yes
+  gather_facts: yes
+  
+  vars:
+    vm_id_min: 1000
+    vm_id_max: 1100
+    output_dir: "/tmp/vm-hashes"
+  
+  tasks:
+    - name: Create output directory on Ansible server
+      delegate_to: localhost
+      run_once: yes
+      file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: '0755'
+    
+    - name: Collect all VM data in one pass
+      shell: |
+        #!/bin/bash
+        
+        # Get VMs in range
+        VM_LIST=$(qm list | awk 'NR>1 && $1>={{ vm_id_min }} && $1<={{ vm_id_max }} {print $1}')
+        
+        if [ -z "$VM_LIST" ]; then
+          echo "[]"
+          exit 0
+        fi
+        
+        # Use jq-style manual JSON building
+        printf "[\n"
+        
+        for VM_ID in $VM_LIST; do
+          # Get status
+          STATUS=$(qm status $VM_ID 2>/dev/null || echo "unknown")
+          
+          # Fail fast if running
+          if echo "$STATUS" | grep -q "running"; then
+            echo "RUNNING:$VM_ID" >&2
+            exit 1
+          fi
+          
+          # Get config hash
+          CONFIG_HASH=$(sha256sum /etc/pve/qemu-server/${VM_ID}.conf 2>/dev/null | awk '{print $1}' || echo "N/A")
+          
+          printf '  {\n'
+          printf '    "vm_id": %s,\n' "$VM_ID"
+          printf '    "status": "%s",\n' "$STATUS"
+          printf '    "config_hash": "%s",\n' "$CONFIG_HASH"
+          printf '    "disks": [\n'
+          
+          # Find all disks and hash them
+          DISK_JSON=""
+          
+          # Directory storage
+          if [ -d "/var/lib/vz/images/${VM_ID}" ]; then
+            while IFS= read -r DISK; do
+              HASH=$(sha256sum "$DISK" 2>/dev/null | awk '{print $1}' || echo "N/A")
+              DISK_JSON="${DISK_JSON}{\"path\":\"$DISK\",\"hash\":\"$HASH\"},"
+            done < <(find /var/lib/vz/images/${VM_ID} -type f \( -name "*.qcow2" -o -name "*.raw" -o -name "*.vmdk" \) 2>/dev/null)
+          fi
+          
+          # LVM storage  
+          while IFS= read -r DISK; do
+            [ -z "$DISK" ] && continue
+            HASH=$(sha256sum "$DISK" 2>/dev/null | awk '{print $1}' || echo "N/A")
+            DISK_JSON="${DISK_JSON}{\"path\":\"$DISK\",\"hash\":\"$HASH\"},"
+          done < <(lvs --noheadings -o lv_path 2>/dev/null | grep "vm-${VM_ID}-disk")
+          
+          # ZFS storage
+          while IFS= read -r ZFS_NAME; do
+            [ -z "$ZFS_NAME" ] && continue
+            DISK="/dev/zvol/$ZFS_NAME"
+            HASH=$(sha256sum "$DISK" 2>/dev/null | awk '{print $1}' || echo "N/A")
+            DISK_JSON="${DISK_JSON}{\"path\":\"$DISK\",\"hash\":\"$HASH\"},"
+          done < <(zfs list -H -o name 2>/dev/null | grep "vm-${VM_ID}-disk")
+          
+          # Remove trailing comma and output
+          DISK_JSON="${DISK_JSON%,}"
+          printf '      %s\n' "$DISK_JSON"
+          printf '    ]\n'
+          printf '  },\n'
+        done | sed '$ s/,$//'  # Remove last comma
+        
+        printf "]\n"
+      register: vm_data_raw
+      changed_when: false
+      failed_when: vm_data_raw.rc != 0
+    
+    - name: Parse VM data
+      set_fact:
+        vm_data: "{{ vm_data_raw.stdout | from_json }}"
+    
+    - name: Save JSON to Ansible server
+      delegate_to: localhost
+      copy:
+        content: |
+          {
+            "node": "{{ ansible_hostname }}",
+            "collection_date": "{{ ansible_date_time.iso8601 }}",
+            "vms": {{ vm_data | to_nice_json }}
+          }
+        dest: "{{ output_dir }}/{{ ansible_hostname }}-hashes.json"
+        mode: '0644'
+
+- name: Create master manifest
+  hosts: localhost
+  gather_facts: yes
+  vars:
+    output_dir: "{{ playbook_dir }}/vm-hashes"
+  tasks:
+    - name: Find all server files
+      find:
+        paths: "{{ output_dir }}"
+        patterns: "*-hashes.json"
+      register: hash_files
+    
+    - name: Load all data
+      set_fact:
+        all_servers: "{{ all_servers | default([]) + [lookup('file', item.path) | from_json] }}"
+      loop: "{{ hash_files.files }}"
+    
+    - name: Create master manifest
+      copy:
+        content: |
+          {
+            "manifest_version": "1.0",
+            "generated": "{{ ansible_date_time.iso8601 }}",
+            "total_nodes": {{ all_servers | length }},
+            "total_vms": {{ all_servers | map(attribute='vms') | map('length') | sum }},
+            "nodes": {{ all_servers | to_nice_json }}
+          }
+        dest: "{{ output_dir }}/golden-images-manifest.json"
+        mode: '0644'
